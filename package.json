@@ -1,7 +1,7 @@
 {
   "name": "foodgo-server",
   "version": "1.0.0",
-  "description": "",
+  "description": "Backend for a food delivery app with in-app calling",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -14,10 +14,10 @@
     "url": "https://github.com/Adetule-ayomide/foodgo-server/issues"
   },
   "dependencies": {
-    "agora-access-token": "^2.0.4",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "firebase-admin": "^13.5.0",
-    "socket.io": "^4.8.1"
+    "socket.io": "^4.8.1",
+    "uuid": "^8.3.2"
   }
 }

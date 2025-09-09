@@ -1,303 +1,272 @@
-// Call Management Backend
 const express = require("express");
-const { RtcTokenBuilder, RtcRole } = require("agora-access-token");
-const admin = require("firebase-admin");
-const cors = require("cors");
 const http = require("http");
-const socketIo = require("socket.io");
+const socketio = require("socket.io");
+const cors = require("cors");
+const { v4: uuidv4 } = require("uuid");
 
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server, {
+
+// Use a simple in-memory store for users and active calls.
+// In a production app, you would use a database (e.g., MongoDB, PostgreSQL, Redis)
+// to store this data for persistence and scalability.
+const users = new Map(); // Maps userId to socketId
+const activeCalls = new Map(); // Maps callId to callSession details
+
+// Use CORS to allow requests from your Expo app
+app.use(cors());
+app.use(express.json());
+
+// Initialize Socket.IO with CORS
+const io = new socketio.Server(server, {
   cors: {
-    origin: "*",
+    origin: "*", // Adjust this to your frontend URL in production
     methods: ["GET", "POST"],
   },
 });
 
-app.use(cors());
-app.use(express.json());
+// Socket.IO connection handler
+io.on("connection", (socket) => {
+  console.log(`User connected: ${socket.id}`);
 
-// Agora Configurations
-const AGORA_APP_ID = process.env.AGORA_APP_ID;
-const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE;
+  // When a user authenticates, store their userId and socketId
+  socket.on("authenticate", (userId) => {
+    console.log(`User ${userId} authenticated with socket ${socket.id}`);
+    users.set(userId, socket.id);
+  });
 
-// Firebase Admin (for push notifications)
-admin.initializeApp({
-  credential: admin.credential.applicationDefault(),
-});
-
-// In-memory storage for active calls (use Redis in production)
-const activeCalls = new Map();
-const userSockets = new Map();
-
-// Generate Agora RTC Token
-function generateAgoraToken(channelName, uid, role = RtcRole.PUBLISHER) {
-  const expirationTimeInSeconds = 3600; // 1 hour
-  const currentTimestamp = Math.floor(Date.now() / 1000);
-  const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
-
-  return RtcTokenBuilder.buildTokenWithUid(
-    AGORA_APP_ID,
-    AGORA_APP_CERTIFICATE,
-    channelName,
-    uid,
-    role,
-    privilegeExpiredTs
-  );
-}
-
-// API Routes
-
-// 1. Initialize Call
-app.post("/api/calls/initiate", async (req, res) => {
-  try {
-    const {
-      callerId,
-      receiverId,
-      orderTrackingId,
-      callType = "voice",
-    } = req.body;
-
-    // Generate unique channel name
-    const channelName = `call_${orderTrackingId}_${Date.now()}`;
-
-    // Generate tokens for both users
-    const callerToken = generateAgoraToken(channelName, parseInt(callerId));
-    const receiverToken = generateAgoraToken(channelName, parseInt(receiverId));
-
-    // Create call session
-    const callSession = {
-      id: `call_${Date.now()}`,
-      channelName,
-      callerId,
-      receiverId,
-      orderTrackingId,
-      callType,
-      status: "initiated",
-      createdAt: new Date().toISOString(),
-      tokens: {
-        caller: callerToken,
-        receiver: receiverToken,
-      },
-    };
-
-    // Store active call
-    activeCalls.set(callSession.id, callSession);
-
-    // Send real-time notification to receiver via Socket.IO
-    const receiverSocketId = userSockets.get(receiverId);
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit("incoming_call", {
-        callId: callSession.id,
-        callerId,
-        callerName: req.body.callerName || "Customer",
-        orderTrackingId,
-        callType,
-      });
-    }
-
-    // Send push notification to receiver
-    await sendPushNotification(receiverId, {
-      title: "Incoming Call",
-      body: `${
-        req.body.callerName || "Customer"
-      } is calling about order #${orderTrackingId}`,
-      data: {
-        type: "incoming_call",
-        callId: callSession.id,
-        callerId,
-        orderTrackingId,
-      },
-    });
-
-    res.json({
-      success: true,
-      callSession: {
-        id: callSession.id,
-        channelName,
-        token: callerToken,
-        agoraAppId: AGORA_APP_ID,
-      },
-    });
-  } catch (error) {
-    console.error("Error initiating call:", error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// 2. Accept Call
-app.post("/api/calls/:callId/accept", async (req, res) => {
-  try {
-    const { callId } = req.params;
-    const { userId } = req.body;
-
+  // Handle incoming audio data and relay it to the other party
+  // Note: This is a simplified relay and would need to be optimized
+  // for real-time performance and WebRTC integration in a production app.
+  socket.on("audio_data", (data) => {
+    const { callId, audioChunk } = data;
     const callSession = activeCalls.get(callId);
-    if (!callSession) {
-      return res.status(404).json({ success: false, error: "Call not found" });
-    }
+    if (!callSession) return;
 
-    // Update call status
-    callSession.status = "accepted";
-    callSession.acceptedAt = new Date().toISOString();
-
-    // Get appropriate token
-    const token =
-      userId === callSession.callerId
-        ? callSession.tokens.caller
-        : callSession.tokens.receiver;
-
-    // Notify caller that call was accepted
-    const callerSocketId = userSockets.get(callSession.callerId);
-    if (callerSocketId && userId !== callSession.callerId) {
-      io.to(callerSocketId).emit("call_accepted", { callId });
-    }
-
-    res.json({
-      success: true,
-      callSession: {
-        id: callSession.id,
-        channelName: callSession.channelName,
-        token,
-        agoraAppId: AGORA_APP_ID,
-      },
-    });
-  } catch (error) {
-    console.error("Error accepting call:", error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// 3. Reject Call
-app.post("/api/calls/:callId/reject", async (req, res) => {
-  try {
-    const { callId } = req.params;
-    const { userId } = req.body;
-
-    const callSession = activeCalls.get(callId);
-    if (!callSession) {
-      return res.status(404).json({ success: false, error: "Call not found" });
-    }
-
-    // Update call status
-    callSession.status = "rejected";
-    callSession.endedAt = new Date().toISOString();
-
-    // Notify caller that call was rejected
-    const callerSocketId = userSockets.get(callSession.callerId);
-    if (callerSocketId) {
-      io.to(callerSocketId).emit("call_rejected", { callId });
-    }
-
-    // Clean up
-    activeCalls.delete(callId);
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error("Error rejecting call:", error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// 4. End Call
-app.post("/api/calls/:callId/end", async (req, res) => {
-  try {
-    const { callId } = req.params;
-    const { userId } = req.body;
-
-    const callSession = activeCalls.get(callId);
-    if (!callSession) {
-      return res.status(404).json({ success: false, error: "Call not found" });
-    }
-
-    // Update call status
-    callSession.status = "ended";
-    callSession.endedAt = new Date().toISOString();
-
-    // Notify other participant
-    const otherUserId =
-      userId === callSession.callerId
+    // Determine the recipient
+    const recipientId =
+      callSession.callerId === data.senderId
         ? callSession.receiverId
         : callSession.callerId;
-    const otherUserSocketId = userSockets.get(otherUserId);
 
-    if (otherUserSocketId) {
-      io.to(otherUserSocketId).emit("call_ended", { callId });
-    }
-
-    // Clean up
-    activeCalls.delete(callId);
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error("Error ending call:", error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Socket.IO Connection Handling
-io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
-
-  // User authentication
-  socket.on("authenticate", (userId) => {
-    userSockets.set(userId, socket.id);
-    console.log(`User ${userId} authenticated with socket ${socket.id}`);
-  });
-
-  // Handle call events
-  socket.on("call_status_update", (data) => {
-    const { callId, status, targetUserId } = data;
-    const targetSocketId = userSockets.get(targetUserId);
-
-    if (targetSocketId) {
-      io.to(targetSocketId).emit("call_status_update", { callId, status });
+    const recipientSocketId = users.get(recipientId);
+    if (recipientSocketId) {
+      console.log(`Relaying audio data for call ${callId}`);
+      io.to(recipientSocketId).emit("audio_data", {
+        callId,
+        timestamp: Date.now(),
+        audioChunk,
+      });
     }
   });
 
+  // Handle user disconnection
   socket.on("disconnect", () => {
-    // Remove user from active sockets
-    for (const [userId, socketId] of userSockets.entries()) {
+    console.log(`User disconnected: ${socket.id}`);
+    // Clean up user from the map
+    for (const [userId, socketId] of users.entries()) {
       if (socketId === socket.id) {
-        userSockets.delete(userId);
+        users.delete(userId);
+        console.log(`User ${userId} removed from active users.`);
+        // Also, handle any active calls this user was in
+        activeCalls.forEach((call, callId) => {
+          if (call.callerId === userId || call.receiverId === userId) {
+            console.log(`Ending call ${callId} due to user disconnect.`);
+            io.to(call.callerId).emit("call_ended", { callId });
+            io.to(call.receiverId).emit("call_ended", { callId });
+            activeCalls.delete(callId);
+          }
+        });
         break;
       }
     }
-    console.log("User disconnected:", socket.id);
   });
 });
 
-// Push Notification Helper
-async function sendPushNotification(userId, notification) {
-  try {
-    // Get user's FCM token from database
-    // const userToken = await getUserFCMToken(userId);
+// API endpoint to initiate a call
+app.post("/api/calls/initiate-simple", (req, res) => {
+  const { callerId, receiverId, orderTrackingId, callerName, callType } =
+    req.body;
 
-    // For demo purposes, assuming you have the token
-    const message = {
-      notification: {
-        title: notification.title,
-        body: notification.body,
-      },
-      data: notification.data,
-      // token: userToken,
-    };
-
-    // await admin.messaging().send(message);
-    console.log("Push notification sent to user:", userId);
-  } catch (error) {
-    console.error("Error sending push notification:", error);
+  if (!callerId || !receiverId) {
+    return res
+      .status(400)
+      .json({ success: false, error: "Caller and receiver IDs are required." });
   }
-}
 
-// Health check
-app.get("/health", (req, res) => {
-  res.json({ status: "OK", timestamp: new Date().toISOString() });
+  // Check if either user is already in a call
+  const isCallerBusy = [...activeCalls.values()].some(
+    (call) =>
+      call.status !== "ended" &&
+      call.status !== "rejected" &&
+      (call.callerId === callerId || call.receiverId === callerId)
+  );
+  const isReceiverBusy = [...activeCalls.values()].some(
+    (call) =>
+      call.status !== "ended" &&
+      call.status !== "rejected" &&
+      (call.callerId === receiverId || call.receiverId === receiverId)
+  );
+
+  if (isCallerBusy) {
+    return res
+      .status(409)
+      .json({ success: false, error: "Caller is already in a call." });
+  }
+
+  if (isReceiverBusy) {
+    return res
+      .status(409)
+      .json({ success: false, error: "Receiver is already in a call." });
+  }
+
+  const callId = uuidv4();
+  const callSession = {
+    id: callId,
+    callerId,
+    receiverId,
+    orderTrackingId,
+    callerName,
+    callType,
+    status: "ringing",
+    createdAt: Date.now(),
+  };
+
+  activeCalls.set(callId, callSession);
+  console.log(`Initiating new call session: ${callId}`);
+
+  // Send push notification (simulated)
+  // In a real app, you would use Expo's Push Notification API
+  // to send a notification to the receiver's Expo Push Token.
+  console.log(
+    `[PUSH] Sending push notification to ${receiverId} for incoming call.`
+  );
+
+  // Notify the receiver via Socket.IO
+  const receiverSocketId = users.get(receiverId);
+  if (receiverSocketId) {
+    io.to(receiverSocketId).emit("incoming_call", {
+      callId,
+      callerId,
+      orderTrackingId,
+      callerName,
+    });
+    console.log(`Notified receiver ${receiverId} of incoming call.`);
+  } else {
+    console.log(`Receiver ${receiverId} is not connected.`);
+    return res.status(404).json({
+      success: false,
+      error: "Receiver not found or is offline.",
+    });
+  }
+
+  res.status(200).json({ success: true, callSession });
+});
+
+// API endpoint to accept a call
+app.post("/api/calls/:callId/accept", (req, res) => {
+  const { callId } = req.params;
+  const { userId } = req.body;
+
+  const callSession = activeCalls.get(callId);
+  if (!callSession) {
+    return res.status(404).json({
+      success: false,
+      error: "Call session not found.",
+    });
+  }
+
+  if (callSession.receiverId !== userId) {
+    return res.status(403).json({
+      success: false,
+      error: "User is not the receiver of this call.",
+    });
+  }
+
+  callSession.status = "accepted";
+  activeCalls.set(callId, callSession);
+  console.log(`Call ${callId} accepted by ${userId}.`);
+
+  // Notify the caller that the call has been accepted
+  const callerSocketId = users.get(callSession.callerId);
+  if (callerSocketId) {
+    io.to(callerSocketId).emit("call_accepted", { callSession });
+  }
+
+  res.status(200).json({ success: true, callSession });
+});
+
+// API endpoint to reject a call
+app.post("/api/calls/:callId/reject", (req, res) => {
+  const { callId } = req.params;
+  const { userId } = req.body;
+
+  const callSession = activeCalls.get(callId);
+  if (!callSession) {
+    return res.status(404).json({
+      success: false,
+      error: "Call session not found.",
+    });
+  }
+
+  if (callSession.receiverId !== userId) {
+    return res.status(403).json({
+      success: false,
+      error: "User is not the receiver of this call.",
+    });
+  }
+
+  callSession.status = "rejected";
+  activeCalls.set(callId, callSession);
+  console.log(`Call ${callId} rejected by ${userId}.`);
+
+  // Notify the caller that the call was rejected
+  const callerSocketId = users.get(callSession.callerId);
+  if (callerSocketId) {
+    io.to(callerSocketId).emit("call_rejected", { callId });
+  }
+
+  // Clean up the call session after rejection
+  activeCalls.delete(callId);
+
+  res.status(200).json({ success: true });
+});
+
+// API endpoint to end a call
+app.post("/api/calls/:callId/end", (req, res) => {
+  const { callId } = req.params;
+  const { userId } = req.body;
+
+  const callSession = activeCalls.get(callId);
+  if (!callSession) {
+    return res.status(404).json({
+      success: false,
+      error: "Call session not found.",
+    });
+  }
+
+  callSession.status = "ended";
+  activeCalls.set(callId, callSession);
+  console.log(`Call ${callId} ended by ${userId}.`);
+
+  // Notify both parties that the call has ended
+  const callerSocketId = users.get(callSession.callerId);
+  const receiverSocketId = users.get(callSession.receiverId);
+
+  if (callerSocketId) {
+    io.to(callerSocketId).emit("call_ended", { callId });
+  }
+  if (receiverSocketId) {
+    io.to(receiverSocketId).emit("call_ended", { callId });
+  }
+
+  // Clean up the call session
+  activeCalls.delete(callId);
+
+  res.status(200).json({ success: true });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Call service running on port ${PORT}`);
+  console.log(`Server is listening on port ${PORT}`);
 });
-
-module.exports = { app, io };
