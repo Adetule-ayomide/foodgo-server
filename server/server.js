@@ -18,7 +18,7 @@ const io = socketIo(server, {
 app.use(cors());
 app.use(express.json());
 
-// Agora Configuration
+// Agora Configurations
 const AGORA_APP_ID = process.env.AGORA_APP_ID;
 const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE;
 
